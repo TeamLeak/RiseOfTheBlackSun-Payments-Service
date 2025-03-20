@@ -1,0 +1,18 @@
+server:
+  port: "11050"
+  success_url: "https://riseoftheblacksun.eu/pay_success"
+  fail_url: "https://riseoftheblacksun.eu/pay_error"
+
+tinkoff:
+  terminal_key: "XXXXXX"
+  secret_key: "XXXXXXXX"
+  notification_url: "https://shopservice.riseoftheblacksun.eu/notify"
+  default_taxation: "osn"   # значение системы налогообложения для всех товаров
+database:
+  dialect: "sqlite3"       # или "postgres"
+  connection: "test.db"      # для postgres укажите connection string
+
+cors:
+  allowed_origins:
+    - "https://riseoftheblacksun.eu"
+    - "riseoftheblacksun.eu"
