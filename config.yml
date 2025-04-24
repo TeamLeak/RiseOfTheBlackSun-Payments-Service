@@ -1,24 +1,24 @@
+# config.yaml (рядом с main.go)
+
 server:
-  port: "11050"
-  success_url: "https://riseoftheblacksun.eu/pay_success"
-  fail_url: "https://riseoftheblacksun.eu/pay_error"
+  port: "8080"
+  success_url: "https://example.com/success"
+  fail_url: "https://example.com/fail"
 
 tinkoff:
-  terminal_key: "XXXXXX"
-  secret_key: "XXXXXXXX"
-  notification_url: "https://shopservice.riseoftheblacksun.eu/notify"
-  default_taxation: "osn"   # значение системы налогообложения для всех товаров
+  terminal_key: "YOUR_TERMINAL_KEY"
+  secret_key: "YOUR_SECRET_KEY"
+  notification_url: "https://yourdomain.com/notify"
+
 database:
-  dialect: "sqlite3"       # или "postgres"
-  connection: "test.db"      # для postgres укажите connection string
+  dialect: "sqlite3"
+  connection: "payments.db"
 
 cors:
   allowed_origins:
-    - "https://riseoftheblacksun.eu"
-    - "riseoftheblacksun.eu"
-external_service:
-  domain: "https://shopservice.riseoftheblacksun.eu/api/process"
+    - "*"
 
-rabbitmq:
-  url: "amqp://guest:guest@localhost:5672/"
-  queue: "purchase-event"
+rcon:
+  address: "127.0.0.1:25575"
+  password: "minecraft_rcon_password"
+  command: "op {player}"
