@@ -1,11 +1,32 @@
+// config.yaml (рядом с main.go)
+//
+// server:
+//   port: "8080"
+//   success_url: "https://example.com/success"
+//   fail_url: "https://example.com/fail"
+//
+// tinkoff:
+//   terminal_key: "YOUR_TERMINAL_KEY"
+//   secret_key: "YOUR_SECRET_KEY"
+//   notification_url: "https://yourdomain.com/notify"
+//
+// database:
+//   dialect: "sqlite3"
+//   connection: "payments.db"
+//
+// cors:
+//   allowed_origins:
+//     - "*"
+//
+// rcon:
+//   address: "127.0.0.1:25575"
+//   password: "minecraft_rcon_password"
+//   command: "op {player}"
+
 package main
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -17,6 +38,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gorcon/rcon"
 	"github.com/nikita-vanyasin/tinkoff"
 	"github.com/rs/cors"
 	"github.com/spf13/viper"
@@ -25,7 +47,7 @@ import (
 	"gorm.io/gorm"
 )
 
-// Config описывает структуру конфигурационного файла.
+// Config описывает конфигурацию сервиса.
 type Config struct {
 	Server struct {
 		Port       string `mapstructure:"port"`
@@ -36,7 +58,6 @@ type Config struct {
 		TerminalKey     string `mapstructure:"terminal_key"`
 		SecretKey       string `mapstructure:"secret_key"`
 		NotificationURL string `mapstructure:"notification_url"`
-		DefaultTaxation string `mapstructure:"default_taxation"`
 	} `mapstructure:"tinkoff"`
 	Database struct {
 		Dialect    string `mapstructure:"dialect"`
@@ -45,9 +66,11 @@ type Config struct {
 	CORS struct {
 		AllowedOrigins []string `mapstructure:"allowed_origins"`
 	} `mapstructure:"cors"`
-	ExternalService struct {
-		Domain string `mapstructure:"domain"`
-	} `mapstructure:"external_service"`
+	RCON struct {
+		Address  string `mapstructure:"address"`
+		Password string `mapstructure:"password"`
+		Command  string `mapstructure:"command"`
+	} `mapstructure:"rcon"`
 }
 
 var (
@@ -56,104 +79,58 @@ var (
 	tinkoffClient *tinkoff.Client
 )
 
-// Payment – модель для хранения информации о платеже.
+// Payment хранит данные о платеже.
 type Payment struct {
 	gorm.Model
-	OrderID      string `gorm:"uniqueIndex"`
-	PaymentID    string
-	Amount       uint64
-	Description  string
-	ClientIP     string
-	PaymentURL   string
-	Status       string
-	PlayerName   string
-	Email        string
-	ProductImage string
-	ReceiptItems string
+	OrderID    string `gorm:"uniqueIndex"`
+	PaymentID  string
+	Amount     uint64
+	PaymentURL string
+	Status     string
+	PlayerName string
 }
 
-// PaymentRequest описывает входящие данные для инициализации платежа.
+// PaymentRequest для инициализации платежа.
 type PaymentRequest struct {
-	OrderID      string  `json:"order_id"`
-	Amount       uint64  `json:"amount"`
-	Description  string  `json:"description"`
-	ClientIP     string  `json:"client_ip"`
-	PlayerName   string  `json:"player_name"`
-	Email        string  `json:"email"`
-	ProductImage string  `json:"product_image"`
-	Receipt      Receipt `json:"receipt"`
+	OrderID    string `json:"order_id"`
+	Amount     uint64 `json:"amount"`
+	ClientIP   string `json:"client_ip"`
+	PlayerName string `json:"player_name"`
 }
 
-// Receipt описывает данные чека.
-type Receipt struct {
-	Email    string        `json:"Email"`
-	Taxation string        `json:"Taxation"`
-	Items    []ReceiptItem `json:"Items"`
-}
-
-// ReceiptItem описывает одну позицию в чеке.
-type ReceiptItem struct {
-	Name     string `json:"Name"`
-	Price    uint64 `json:"Price"`
-	Quantity string `json:"Quantity"`
-	Amount   uint64 `json:"Amount"`
-	Tax      string `json:"Tax"`
-}
-
-// PaymentResponse возвращается клиенту после инициализации платежа.
+// PaymentResponse возвращает URL для оплаты.
 type PaymentResponse struct {
 	PaymentURL string `json:"payment_url"`
-	Message    string `json:"message,omitempty"`
 }
 
-// PaymentNotificationData – структура уведомления от Tinkoff.
-type PaymentNotificationData struct {
-	TerminalKey string      `json:"TerminalKey"`
-	OrderID     string      `json:"OrderId"`
-	PaymentID   json.Number `json:"PaymentId"`
-	Status      string      `json:"Status"`
-	ErrorCode   string      `json:"ErrorCode"`
-	Message     string      `json:"Message"`
+// Notification – структура уведомления от Tinkoff Acquiring.
+type Notification struct {
+	OrderID   string      `json:"OrderId"`
+	PaymentID json.Number `json:"PaymentId"`
+	Status    string      `json:"Status"`
 }
 
-// loadConfig загружает конфигурацию из файла config.yaml.
+// loadConfig загружает настройки из config.yaml.
 func loadConfig() error {
 	viper.SetConfigName("config")
 	viper.SetConfigType("yaml")
 	viper.AddConfigPath(".")
-	// Дефолтные настройки
+	_ = viper.ReadInConfig()
 	viper.SetDefault("server.port", "8080")
-	viper.SetDefault("server.success_url", "https://example.com/success")
-	viper.SetDefault("server.fail_url", "https://example.com/fail")
-
-	viper.SetDefault("tinkoff.terminal_key", "")
-	viper.SetDefault("tinkoff.secret_key", "")
-	viper.SetDefault("tinkoff.notification_url", "")
-	viper.SetDefault("tinkoff.default_taxation", "osn")
-
 	viper.SetDefault("database.dialect", "sqlite3")
 	viper.SetDefault("database.connection", "payments.db")
-
 	viper.SetDefault("cors.allowed_origins", []string{"*"})
-
-	viper.SetDefault("external_service.domain", "")
-
-	if err := viper.ReadInConfig(); err != nil {
-		log.Println("Используем дефолтные настройки, так как config.yaml не найден")
-	}
 	return viper.Unmarshal(&config)
 }
 
-// initDB открывает соединение с базой данных.
+// initDB подключается к БД и мигрирует модель Payment.
 func initDB() error {
 	var err error
 	switch config.Database.Dialect {
-	case "sqlite3":
-		db, err = gorm.Open(sqlite.Open(config.Database.Connection), &gorm.Config{})
 	case "postgres":
 		db, err = gorm.Open(postgres.Open(config.Database.Connection), &gorm.Config{})
 	default:
-		return fmt.Errorf("unsupported database dialect: %s", config.Database.Dialect)
+		db, err = gorm.Open(sqlite.Open(config.Database.Connection), &gorm.Config{})
 	}
 	if err != nil {
 		return err
@@ -161,35 +138,7 @@ func initDB() error {
 	return db.AutoMigrate(&Payment{})
 }
 
-// convertReceiptItems конвертирует позиции чека в формат tinkoff.
-func convertReceiptItems(items []ReceiptItem) []*tinkoff.ReceiptItem {
-	var res []*tinkoff.ReceiptItem
-	for _, item := range items {
-		res = append(res, &tinkoff.ReceiptItem{
-			Name:     item.Name,
-			Price:    item.Price,
-			Quantity: item.Quantity,
-			Amount:   item.Amount,
-			Tax:      tinkoff.VATNone,
-		})
-	}
-	return res
-}
-
-// convertReceipt преобразует Receipt в структуру tinkoff.Receipt.
-func convertReceipt(r Receipt, totalAmount uint64) *tinkoff.Receipt {
-	return &tinkoff.Receipt{
-		Email:    r.Email,
-		Phone:    "",
-		Taxation: r.Taxation,
-		Items:    convertReceiptItems(r.Items),
-		Payments: &tinkoff.ReceiptPayments{
-			Electronic: totalAmount,
-		},
-	}
-}
-
-// payHandler – обработчик инициализации платежа.
+// payHandler инициализирует платёж через Tinkoff.
 func payHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Метод не поддерживается", http.StatusMethodNotAllowed)
@@ -200,153 +149,100 @@ func payHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Неверный формат запроса", http.StatusBadRequest)
 		return
 	}
-	// валидация
-	if req.OrderID == "" || req.Amount == 0 || req.ClientIP == "" || req.PlayerName == "" || req.Email == "" {
-		http.Error(w, "Поля order_id, amount, client_ip, player_name и email обязательны", http.StatusBadRequest)
-		return
-	}
-	// формируем URLs с передачей player_name
+	// формируем success/fail URLs с никнеймом
 	q := url.Values{}
 	q.Set("order_id", req.OrderID)
 	q.Set("player_name", req.PlayerName)
-	successURL := fmt.Sprintf("%s?%s", config.Server.SuccessURL, q.Encode())
-	failURL := fmt.Sprintf("%s?%s", config.Server.FailURL, q.Encode())
+	sURL := fmt.Sprintf("%s?%s", config.Server.SuccessURL, q.Encode())
+	fURL := fmt.Sprintf("%s?%s", config.Server.FailURL, q.Encode())
 
 	initReq := &tinkoff.InitRequest{
-		Amount:          req.Amount,
 		OrderID:         req.OrderID,
+		Amount:          req.Amount,
 		ClientIP:        req.ClientIP,
-		Description:     req.Description,
+		Description:     "",
 		Language:        "ru",
-		SuccessURL:      successURL,
-		FailURL:         failURL,
+		SuccessURL:      sURL,
+		FailURL:         fURL,
 		NotificationURL: config.Tinkoff.NotificationURL,
-		Receipt:         convertReceipt(req.Receipt, req.Amount),
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-
-	initResp, err := tinkoffClient.InitWithContext(ctx, initReq)
+	res, err := tinkoffClient.InitWithContext(ctx, initReq)
 	if err != nil {
-		log.Printf("Ошибка инициализации платежа: %v", err)
-		http.Error(w, "Ошибка инициализации платежа", http.StatusInternalServerError)
+		http.Error(w, "Ошибка инициализации", http.StatusInternalServerError)
 		return
 	}
-
 	// сохраняем в БД
-	receiptItemsJSON, _ := json.Marshal(req.Receipt.Items)
-	payment := Payment{
-		OrderID:      req.OrderID,
-		PaymentID:    initResp.PaymentID,
-		Amount:       req.Amount,
-		Description:  req.Description,
-		ClientIP:     req.ClientIP,
-		PaymentURL:   initResp.PaymentURL,
-		Status:       "INIT",
-		PlayerName:   req.PlayerName,
-		Email:        req.Email,
-		ProductImage: req.ProductImage,
-		ReceiptItems: string(receiptItemsJSON),
-	}
-	db.Create(&payment)
-
+	db.Create(&Payment{OrderID: res.OrderID, PaymentID: res.PaymentID, Amount: req.Amount, PaymentURL: res.PaymentURL, Status: res.Status, PlayerName: req.PlayerName})
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(PaymentResponse{PaymentURL: initResp.PaymentURL})
+	json.NewEncoder(w).Encode(PaymentResponse{PaymentURL: res.PaymentURL})
 }
 
-// notifyHandler – обработчик уведомлений от Tinkoff.
+// notifyHandler обрабатывает колбэк и выполняет RCON-команду.
 func notifyHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Метод не поддерживается", http.StatusMethodNotAllowed)
 		return
 	}
-	var notif PaymentNotificationData
+	var notif Notification
 	if err := json.NewDecoder(r.Body).Decode(&notif); err != nil {
-		log.Printf("Ошибка декодирования уведомления: %v", err)
-		http.Error(w, "Неверный формат уведомления", http.StatusBadRequest)
+		http.Error(w, "Неверный колбэк", http.StatusBadRequest)
 		return
 	}
-
-	// находим платеж
-	var payment Payment
-	if err := db.Where("order_id = ?", notif.OrderID).First(&payment).Error; err != nil {
-		log.Printf("Платеж не найден: %v", err)
-	} else {
-		payment.Status = notif.Status
-		payment.PaymentID = notif.PaymentID.String()
-		db.Save(&payment)
-
-		// если подтверждён — показываем никнейм
-		if notif.Status == tinkoff.StatusConfirmed {
-			fmt.Printf("[SUCCESS] PlayerName: %q\n", payment.PlayerName)
+	// обновляем статус
+	db.Model(&Payment{}).Where("order_id = ?", notif.OrderID).Updates(Payment{Status: notif.Status})
+	if notif.Status == tinkoff.StatusConfirmed {
+		// получаем платеж
+		var p Payment
+		db.Where("order_id = ?", notif.OrderID).First(&p)
+		// формируем RCON команду
+		cmd := strings.ReplaceAll(config.RCON.Command, "{player}", p.PlayerName)
+		// соединяемся и шлём
+		rc, err := rcon.Dial(config.RCON.Address, config.RCON.Password)
+		if err != nil {
+			log.Printf("RCON connect failed: %v", err)
+		} else {
+			if resp, err := rc.Write(cmd); err != nil {
+				log.Printf("RCON write failed: %v", err)
+			} else {
+				log.Printf("RCON response: %s", resp)
+			}
+			rc.Close()
 		}
+		// логиним ник
+		log.Printf("[PAYMENT SUCCESS] player: %s", p.PlayerName)
 	}
-
 	w.Write([]byte("OK"))
 }
 
-// checkHandler – проверка статуса на запросе.
-func checkHandler(w http.ResponseWriter, r *http.Request) {
-	orderID := r.URL.Query().Get("order_id")
-	if orderID == "" {
-		http.Error(w, "order_id обязателен", http.StatusBadRequest)
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	res, err := tinkoffClient.CheckOrderWithContext(ctx, &tinkoff.CheckOrderRequest{OrderID: orderID})
-	if err != nil {
-		http.Error(w, "Ошибка проверки", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(res)
-}
-
 func main() {
-	// загрузка конфигурации
+	// загрузка конфига
 	if err := loadConfig(); err != nil {
-		log.Fatalf("config load error: %v", err)
+		log.Fatalf("Config error: %v", err)
 	}
-	// инициализация БД
+	// init DB
 	if err := initDB(); err != nil {
-		log.Fatalf("db init error: %v", err)
+		log.Fatalf("DB error: %v", err)
 	}
-	// клиент Тинькофф
+	// Tinkoff клиент
 	tinkoffClient = tinkoff.NewClient(config.Tinkoff.TerminalKey, config.Tinkoff.SecretKey)
 
-	// маршруты
 	mux := http.NewServeMux()
 	mux.HandleFunc("/pay", payHandler)
 	mux.HandleFunc("/notify", notifyHandler)
-	mux.HandleFunc("/check", checkHandler)
 
-	c := cors.New(cors.Options{
-		AllowedOrigins:   config.CORS.AllowedOrigins,
-		AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
-		AllowedHeaders:   []string{"Content-Type"},
-		AllowCredentials: true,
-	})
-	handler := c.Handler(mux)
-
+	h := cors.New(cors.Options{AllowedOrigins: config.CORS.AllowedOrigins}).Handler(mux)
+	srv := &http.Server{Addr: ":" + config.Server.Port, Handler: h}
 	// graceful shutdown
-	server := &http.Server{
-		Addr:    ":" + config.Server.Port,
-		Handler: handler,
-	}
-	idle := make(chan struct{})
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-		<-sig
-		server.Shutdown(context.Background())
-		close(idle)
+		<-quit
+		srv.Shutdown(context.Background())
 	}()
 
-	log.Printf("Сервер запущен на порту %s", config.Server.Port)
-	if err := server.ListenAndServe(); err != http.ErrServerClosed {
-		log.Fatalf("ListenAndServe: %v", err)
-	}
-	<-idle
-	log.Println("Сервер остановлен")
+	log.Printf("Server started on :%s", config.Server.Port)
+	srv.ListenAndServe()
+	log.Println("Server stopped")
 }
