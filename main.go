@@ -3,265 +3,148 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/nikita-vanyasin/tinkoff"
 	"github.com/rs/cors"
 	"github.com/spf13/viper"
-	"golang.org/x/sync/errgroup"
-	"golang.org/x/sync/semaphore"
 	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
 
-// Модели базы данных
-type Shop struct {
-	gorm.Model
-	UUID        string `gorm:"uniqueIndex"`
-	Name        string
-	Description string
-	Active      bool
-	Terminals   []Terminal
-	Products    []Product
-}
-
-type Terminal struct {
-	gorm.Model
-	UUID           string `gorm:"uniqueIndex"`
-	Name           string
-	TerminalKey    string
-	SecretKey      string
-	NotificationURL string
-	Active         bool
-	ShopID         uint
-	Shop           Shop
-}
-
-type Product struct {
-	gorm.Model
-	UUID        string `gorm:"uniqueIndex"`
-	SKU         string
-	Name        string
-	Description string
-	Price       uint64
-	Image       string
-	Active      bool
-	ShopID      uint
-	Shop        Shop
-}
-
-type Payment struct {
-	gorm.Model
-	UUID        string `gorm:"uniqueIndex"`
-	OrderID     string `gorm:"uniqueIndex"`
-	PaymentID   string
-	Amount      uint64
-	Status      string
-	PlayerName  string
-	Email       string
-	ShopID      uint
-	Shop        Shop
-	TerminalID  uint
-	Terminal    Terminal
-	Items       []OrderItem
-}
-
-type OrderItem struct {
-	gorm.Model
-	UUID       string `gorm:"uniqueIndex"`
-	PaymentID  uint
-	Payment    Payment
-	ProductID  uint
-	Product    Product
-	Quantity   int
-	Price      uint64
-	TotalPrice uint64
-}
-
-// Структуры конфигурации
+// Config описывает структуру конфигурационного файла.
 type Config struct {
 	Server struct {
-		Port         string `mapstructure:"port"`
-		Workers      int    `mapstructure:"workers"`
-		ReadTimeout  int    `mapstructure:"read_timeout"`
-		WriteTimeout int    `mapstructure:"write_timeout"`
+		Port       string `mapstructure:"port"`
+		SuccessURL string `mapstructure:"success_url"`
+		FailURL    string `mapstructure:"fail_url"`
 	} `mapstructure:"server"`
-
+	Tinkoff struct {
+		TerminalKey     string `mapstructure:"terminal_key"`
+		SecretKey       string `mapstructure:"secret_key"`
+		NotificationURL string `mapstructure:"notification_url"`
+		DefaultTaxation string `mapstructure:"default_taxation"`
+	} `mapstructure:"tinkoff"`
 	Database struct {
 		Dialect    string `mapstructure:"dialect"`
 		Connection string `mapstructure:"connection"`
-		LogMode    bool   `mapstructure:"log_mode"`
 	} `mapstructure:"database"`
-
 	CORS struct {
 		AllowedOrigins []string `mapstructure:"allowed_origins"`
-		AllowedMethods []string `mapstructure:"allowed_methods"`
 	} `mapstructure:"cors"`
-
 	ExternalService struct {
-		Domain     string `mapstructure:"domain"`
-		MaxRetries int    `mapstructure:"max_retries"`
-		Timeout    int    `mapstructure:"timeout"`
+		Domain string `mapstructure:"domain"`
 	} `mapstructure:"external_service"`
-
-	Shops []ShopConfig `mapstructure:"shops"`
 }
 
-type ShopConfig struct {
-	UUID        string          `mapstructure:"uuid"`
-	Name        string          `mapstructure:"name"`
-	Description string          `mapstructure:"description"`
-	Terminals   []TerminalConfig `mapstructure:"terminals"`
-	Products    []ProductConfig  `mapstructure:"products"`
+var (
+	config        Config
+	db            *gorm.DB
+	tinkoffClient *tinkoff.Client
+)
+
+// Payment – модель для хранения информации о платеже.
+type Payment struct {
+	gorm.Model
+	OrderID      string `gorm:"uniqueIndex"`
+	PaymentID    string
+	Amount       uint64
+	Description  string
+	ClientIP     string
+	PaymentURL   string
+	Status       string
+	PlayerName   string
+	Email        string
+	ProductImage string
+	ReceiptItems string
 }
 
-type TerminalConfig struct {
-	UUID            string `mapstructure:"uuid"`
-	Name            string `mapstructure:"name"`
-	TerminalKey     string `mapstructure:"terminal_key"`
-	SecretKey       string `mapstructure:"secret_key"`
-	NotificationURL string `mapstructure:"notification_url"`
-	SuccessURL      string `mapstructure:"success_url"`
-	FailURL         string `mapstructure:"fail_url"`
-}
-
-type ProductConfig struct {
-	UUID        string `mapstructure:"uuid"`
-	SKU         string `mapstructure:"sku"`
-	Name        string `mapstructure:"name"`
-	Description string `mapstructure:"description"`
-	Price       uint64 `mapstructure:"price"`
-	Image       string `mapstructure:"image"`
-}
-
-// Запросы и ответы API
+// PaymentRequest описывает входящие данные для инициализации платежа.
 type PaymentRequest struct {
-	ShopID     string              `json:"shop_id"`
-	OrderID    string              `json:"order_id"`
-	Products   []OrderProductRequest `json:"products"`
-	ClientIP   string              `json:"client_ip"`
-	PlayerName string              `json:"player_name"`
-	Email      string              `json:"email"`
+	OrderID      string  `json:"order_id"`
+	Amount       uint64  `json:"amount"`
+	Description  string  `json:"description"`
+	ClientIP     string  `json:"client_ip"`
+	PlayerName   string  `json:"player_name"`
+	Email        string  `json:"email"`
+	ProductImage string  `json:"product_image"`
+	Receipt      Receipt `json:"receipt"`
 }
 
-type OrderProductRequest struct {
-	ProductID string `json:"product_id"`
-	Quantity  int    `json:"quantity"`
+// Receipt описывает данные чека.
+type Receipt struct {
+	Email    string        `json:"Email"`
+	Taxation string        `json:"Taxation"`
+	Items    []ReceiptItem `json:"Items"`
 }
 
+// ReceiptItem описывает одну позицию в чеке.
+type ReceiptItem struct {
+	Name     string `json:"Name"`
+	Price    uint64 `json:"Price"`
+	Quantity string `json:"Quantity"`
+	Amount   uint64 `json:"Amount"`
+	Tax      string `json:"Tax"`
+}
+
+// PaymentResponse возвращается клиенту после инициализации платежа.
 type PaymentResponse struct {
 	PaymentURL string `json:"payment_url"`
-	OrderID    string `json:"order_id"`
 	Message    string `json:"message,omitempty"`
 }
 
+// PaymentNotificationData – структура уведомления от Tinkoff.
 type PaymentNotificationData struct {
 	TerminalKey string      `json:"TerminalKey"`
 	OrderID     string      `json:"OrderId"`
 	PaymentID   json.Number `json:"PaymentId"`
 	Status      string      `json:"Status"`
+	ErrorCode   string      `json:"ErrorCode"`
+	Message     string      `json:"Message"`
 }
 
-type ShopResponse struct {
-	UUID        string           `json:"uuid"`
-	Name        string           `json:"name"`
-	Description string           `json:"description"`
-	Products    []ProductResponse `json:"products"`
-}
-
-type ProductResponse struct {
-	UUID        string `json:"uuid"`
-	SKU         string `json:"sku"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Price       uint64 `json:"price"`
-	Image       string `json:"image"`
-}
-
-// Глобальные переменные
-var (
-	config     Config
-	db         *gorm.DB
-	shopsMutex sync.RWMutex
-	shopCache  map[string]*Shop
-	sem        *semaphore.Weighted
-)
-
-// Сервис для работы с терминалами Tinkoff
-type TinkoffService struct {
-	clientCache map[string]*tinkoff.Client
-	mu          sync.RWMutex
-}
-
-func NewTinkoffService() *TinkoffService {
-	return &TinkoffService{
-		clientCache: make(map[string]*tinkoff.Client),
-	}
-}
-
-func (ts *TinkoffService) GetClient(terminalKey, secretKey string) *tinkoff.Client {
-	ts.mu.RLock()
-	client, exists := ts.clientCache[terminalKey]
-	ts.mu.RUnlock()
-
-	if !exists {
-		client = tinkoff.NewClient(terminalKey, secretKey)
-		ts.mu.Lock()
-		ts.clientCache[terminalKey] = client
-		ts.mu.Unlock()
-	}
-
-	return client
-}
-
-// Инициализация конфигурации
+// loadConfig загружает конфигурацию из файла config.yaml.
 func loadConfig() error {
 	viper.SetConfigName("config")
 	viper.SetConfigType("yaml")
 	viper.AddConfigPath(".")
-
-	setDefaults()
-
-	if err := viper.ReadInConfig(); err != nil {
-		log.Println("Warning: Using default config")
-	}
-
-	if err := viper.Unmarshal(&config); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func setDefaults() {
+	// Дефолтные настройки
 	viper.SetDefault("server.port", "8080")
-	viper.SetDefault("server.workers", 10)
-	viper.SetDefault("server.read_timeout", 10)
-	viper.SetDefault("server.write_timeout", 10)
-	
+	viper.SetDefault("server.success_url", "https://example.com/success")
+	viper.SetDefault("server.fail_url", "https://example.com/fail")
+
+	viper.SetDefault("tinkoff.terminal_key", "")
+	viper.SetDefault("tinkoff.secret_key", "")
+	viper.SetDefault("tinkoff.notification_url", "")
+	viper.SetDefault("tinkoff.default_taxation", "osn")
+
 	viper.SetDefault("database.dialect", "sqlite3")
 	viper.SetDefault("database.connection", "payments.db")
-	viper.SetDefault("database.log_mode", false)
-	
+
 	viper.SetDefault("cors.allowed_origins", []string{"*"})
-	viper.SetDefault("cors.allowed_methods", []string{"GET", "POST", "OPTIONS"})
-	
-	viper.SetDefault("external_service.max_retries", 3)
-	viper.SetDefault("external_service.timeout", 10)
+
+	viper.SetDefault("external_service.domain", "")
+
+	if err := viper.ReadInConfig(); err != nil {
+		log.Println("Используем дефолтные настройки, так как config.yaml не найден")
+	}
+	return viper.Unmarshal(&config)
 }
 
-// Инициализация базы данных
+// initDB открывает соединение с базой данных.
 func initDB() error {
 	var err error
 	switch config.Database.Dialect {
@@ -272,671 +155,198 @@ func initDB() error {
 	default:
 		return fmt.Errorf("unsupported database dialect: %s", config.Database.Dialect)
 	}
-
 	if err != nil {
 		return err
 	}
-
-	// Автомиграция схемы БД
-	if err := db.AutoMigrate(&Shop{}, &Terminal{}, &Product{}, &Payment{}, &OrderItem{}); err != nil {
-		return err
-	}
-
-	// Инициализация кэша магазинов
-	shopCache = make(map[string]*Shop)
-
-	return nil
+	return db.AutoMigrate(&Payment{})
 }
 
-// Загрузка и обновление данных из конфигурации
-func loadShops() error {
-	for _, shopConfig := range config.Shops {
-		var shop Shop
-		result := db.Where("uuid = ?", shopConfig.UUID).First(&shop)
-		if result.Error != nil && result.Error != gorm.ErrRecordNotFound {
-			return result.Error
-		}
-
-		isNewShop := result.Error == gorm.ErrRecordNotFound
-		if isNewShop {
-			shop = Shop{
-				UUID:        shopConfig.UUID,
-				Name:        shopConfig.Name,
-				Description: shopConfig.Description,
-				Active:      true,
-			}
-			if err := db.Create(&shop).Error; err != nil {
-				return err
-			}
-		} else {
-			shop.Name = shopConfig.Name
-			shop.Description = shopConfig.Description
-			if err := db.Save(&shop).Error; err != nil {
-				return err
-			}
-		}
-
-		// Обновление терминалов
-		for _, termConfig := range shopConfig.Terminals {
-			var terminal Terminal
-			result := db.Where("uuid = ?", termConfig.UUID).First(&terminal)
-			if result.Error != nil && result.Error != gorm.ErrRecordNotFound {
-				return result.Error
-			}
-
-			isNewTerminal := result.Error == gorm.ErrRecordNotFound
-			if isNewTerminal {
-				terminal = Terminal{
-					UUID:           termConfig.UUID,
-					Name:           termConfig.Name,
-					TerminalKey:    termConfig.TerminalKey,
-					SecretKey:      termConfig.SecretKey,
-					NotificationURL: termConfig.NotificationURL,
-					Active:         true,
-					ShopID:         shop.ID,
-				}
-				if err := db.Create(&terminal).Error; err != nil {
-					return err
-				}
-			} else {
-				terminal.Name = termConfig.Name
-				terminal.TerminalKey = termConfig.TerminalKey
-				terminal.SecretKey = termConfig.SecretKey
-				terminal.NotificationURL = termConfig.NotificationURL
-				terminal.ShopID = shop.ID
-				if err := db.Save(&terminal).Error; err != nil {
-					return err
-				}
-			}
-		}
-
-		// Обновление продуктов
-		for _, prodConfig := range shopConfig.Products {
-			var product Product
-			result := db.Where("uuid = ?", prodConfig.UUID).First(&product)
-			if result.Error != nil && result.Error != gorm.ErrRecordNotFound {
-				return result.Error
-			}
-
-			isNewProduct := result.Error == gorm.ErrRecordNotFound
-			if isNewProduct {
-				product = Product{
-					UUID:        prodConfig.UUID,
-					SKU:         prodConfig.SKU,
-					Name:        prodConfig.Name,
-					Description: prodConfig.Description,
-					Price:       prodConfig.Price,
-					Image:       prodConfig.Image,
-					Active:      true,
-					ShopID:      shop.ID,
-				}
-				if err := db.Create(&product).Error; err != nil {
-					return err
-				}
-			} else {
-				product.SKU = prodConfig.SKU
-				product.Name = prodConfig.Name
-				product.Description = prodConfig.Description
-				product.Price = prodConfig.Price
-				product.Image = prodConfig.Image
-				product.ShopID = shop.ID
-				if err := db.Save(&product).Error; err != nil {
-					return err
-				}
-			}
-		}
-	}
-
-	return nil
-}
-
-// Обновление кэша магазинов
-func updateShopCache() error {
-	var shops []Shop
-	if err := db.Preload("Terminals").Preload("Products").Where("active = ?", true).Find(&shops).Error; err != nil {
-		return err
-	}
-
-	newCache := make(map[string]*Shop)
-	for i := range shops {
-		newCache[shops[i].UUID] = &shops[i]
-	}
-
-	shopsMutex.Lock()
-	shopCache = newCache
-	shopsMutex.Unlock()
-
-	return nil
-}
-
-// Получение магазина из кэша
-func getShopByUUID(uuid string) (*Shop, error) {
-	shopsMutex.RLock()
-	shop, exists := shopCache[uuid]
-	shopsMutex.RUnlock()
-
-	if !exists {
-		return nil, fmt.Errorf("shop not found")
-	}
-
-	return shop, nil
-}
-
-// Выбор оптимального терминала для магазина
-func selectTerminal(shop *Shop) (*Terminal, error) {
-	if len(shop.Terminals) == 0 {
-		return nil, fmt.Errorf("no active terminals for shop %s", shop.Name)
-	}
-
-	// Имитация балансировки нагрузки
-	// В реальном приложении, можно использовать более сложную логику
-	var activeTerminals []Terminal
-	for _, term := range shop.Terminals {
-		if term.Active {
-			activeTerminals = append(activeTerminals, term)
-		}
-	}
-
-	if len(activeTerminals) == 0 {
-		return nil, fmt.Errorf("no active terminals for shop %s", shop.Name)
-	}
-
-	// Простой round-robin выбор терминала
-	selected := activeTerminals[time.Now().UnixNano()%int64(len(activeTerminals))]
-	return &selected, nil
-}
-
-// Проверка и подготовка заказа
-func prepareOrder(req PaymentRequest) (*Shop, []Product, []OrderItem, uint64, error) {
-	shop, err := getShopByUUID(req.ShopID)
-	if err != nil {
-		return nil, nil, nil, 0, err
-	}
-
-	if len(req.Products) == 0 {
-		return nil, nil, nil, 0, fmt.Errorf("no products specified")
-	}
-
-	productMap := make(map[string]Product)
-	for _, p := range shop.Products {
-		if p.Active {
-			productMap[p.UUID] = p
-		}
-	}
-
-	var selectedProducts []Product
-	var orderItems []OrderItem
-	var totalAmount uint64
-
-	for _, reqProduct := range req.Products {
-		product, exists := productMap[reqProduct.ProductID]
-		if !exists {
-			return nil, nil, nil, 0, fmt.Errorf("product %s not found or inactive", reqProduct.ProductID)
-		}
-
-		if reqProduct.Quantity <= 0 {
-			reqProduct.Quantity = 1
-		}
-
-		totalPrice := product.Price * uint64(reqProduct.Quantity)
-		totalAmount += totalPrice
-
-		selectedProducts = append(selectedProducts, product)
-		orderItems = append(orderItems, OrderItem{
-			UUID:       uuid.New().String(),
-			ProductID:  product.ID,
-			Product:    product,
-			Quantity:   reqProduct.Quantity,
-			Price:      product.Price,
-			TotalPrice: totalPrice,
-		})
-	}
-
-	if totalAmount == 0 {
-		return nil, nil, nil, 0, fmt.Errorf("total amount cannot be zero")
-	}
-
-	return shop, selectedProducts, orderItems, totalAmount, nil
-}
-
-// Создание чека для Tinkoff API
-func createReceipt(orderItems []OrderItem, email string) *tinkoff.Receipt {
-	var items []*tinkoff.ReceiptItem
-	var totalAmount uint64
-
-	for _, item := range orderItems {
-		items = append(items, &tinkoff.ReceiptItem{
-			Name:     item.Product.Name,
+// convertReceiptItems конвертирует позиции чека в формат tinkoff.
+func convertReceiptItems(items []ReceiptItem) []*tinkoff.ReceiptItem {
+	var res []*tinkoff.ReceiptItem
+	for _, item := range items {
+		res = append(res, &tinkoff.ReceiptItem{
+			Name:     item.Name,
 			Price:    item.Price,
-			Quantity: fmt.Sprintf("%d", item.Quantity),
-			Amount:   item.TotalPrice,
+			Quantity: item.Quantity,
+			Amount:   item.Amount,
 			Tax:      tinkoff.VATNone,
 		})
-		totalAmount += item.TotalPrice
 	}
+	return res
+}
 
+// convertReceipt преобразует Receipt в структуру tinkoff.Receipt.
+func convertReceipt(r Receipt, totalAmount uint64) *tinkoff.Receipt {
 	return &tinkoff.Receipt{
-		Email:    email,
-		Taxation: "usn_income",
-		Items:    items,
+		Email:    r.Email,
+		Phone:    "",
+		Taxation: r.Taxation,
+		Items:    convertReceiptItems(r.Items),
 		Payments: &tinkoff.ReceiptPayments{
 			Electronic: totalAmount,
 		},
 	}
 }
 
-// Генерация описания заказа
-func generateDescription(orderItems []OrderItem) string {
-	var names []string
-	for _, item := range orderItems {
-		if item.Quantity > 1 {
-			names = append(names, fmt.Sprintf("%s x%d", item.Product.Name, item.Quantity))
-		} else {
-			names = append(names, item.Product.Name)
-		}
+// payHandler – обработчик инициализации платежа.
+func payHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Метод не поддерживается", http.StatusMethodNotAllowed)
+		return
 	}
-	return "Purchase: " + strings.Join(names, ", ")
-}
-
-// HTTP обработчики
-func payHandler(tinkoffService *TinkoffService) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var req PaymentRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request format", http.StatusBadRequest)
-			return
-		}
-
-		// Получить разрешение на выполнение в пуле воркеров
-		ctx := r.Context()
-		if err := sem.Acquire(ctx, 1); err != nil {
-			http.Error(w, "Server is busy, try again later", http.StatusServiceUnavailable)
-			return
-		}
-		defer sem.Release(1)
-
-		// Проверяем и подготавливаем заказ
-		shop, products, orderItems, totalAmount, err := prepareOrder(req)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		// Выбираем терминал
-		terminal, err := selectTerminal(shop)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		// Используем или генерируем orderID
-		orderID := req.OrderID
-		if orderID == "" {
-			orderID = uuid.New().String()
-		}
-
-		// Проверяем уникальность orderID
-		var existingPayment Payment
-		if db.Where("order_id = ?", orderID).First(&existingPayment).Error == nil {
-			http.Error(w, "Order ID already exists", http.StatusBadRequest)
-			return
-		}
-
-		// Формируем URL для успешной оплаты и неудачи
-		var termConfig TerminalConfig
-		for _, shopConfig := range config.Shops {
-			if shopConfig.UUID == shop.UUID {
-				for _, tc := range shopConfig.Terminals {
-					if tc.UUID == terminal.UUID {
-						termConfig = tc
-						break
-					}
-				}
-				break
-			}
-		}
-
-		successURL := fmt.Sprintf("%s?order_id=%s", termConfig.SuccessURL, orderID)
-		failURL := fmt.Sprintf("%s?order_id=%s", termConfig.FailURL, orderID)
-
-		// Создаем запрос к Tinkoff
-		tinkoffClient := tinkoffService.GetClient(terminal.TerminalKey, terminal.SecretKey)
-		initReq := &tinkoff.InitRequest{
-			Amount:          totalAmount,
-			OrderID:         orderID,
-			ClientIP:        req.ClientIP,
-			Description:     generateDescription(orderItems),
-			SuccessURL:      successURL,
-			FailURL:         failURL,
-			NotificationURL: terminal.NotificationURL,
-			Receipt:         createReceipt(orderItems, req.Email),
-		}
-
-		// Создаем таймаут контекст для запроса
-		reqCtx, cancel := context.WithTimeout(ctx, time.Duration(config.ExternalService.Timeout)*time.Second)
-		defer cancel()
-
-		// Инициализируем платеж
-		initResp, err := tinkoffClient.InitWithContext(reqCtx, initReq)
-		if err != nil {
-			log.Printf("Payment init failed: %v", err)
-			http.Error(w, "Payment initialization failed", http.StatusInternalServerError)
-			return
-		}
-
-		// Создаем новый платеж в БД
-		payment := Payment{
-			UUID:       uuid.New().String(),
-			OrderID:    orderID,
-			PaymentID:  initResp.PaymentID,
-			Amount:     totalAmount,
-			Status:     "INIT",
-			PlayerName: req.PlayerName,
-			Email:      req.Email,
-			ShopID:     shop.ID,
-			Shop:       *shop,
-			TerminalID: terminal.ID,
-			Terminal:   *terminal,
-			Items:      orderItems,
-		}
-
-		// Сохраняем платеж и его товары
-		if err := db.Create(&payment).Error; err != nil {
-			log.Printf("Failed to save payment: %v", err)
-			http.Error(w, "Failed to process payment", http.StatusInternalServerError)
-			return
-		}
-
-		// Возвращаем URL для оплаты
-		json.NewEncoder(w).Encode(PaymentResponse{
-			PaymentURL: initResp.PaymentURL,
-			OrderID:    orderID,
-		})
+	var req PaymentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Неверный формат запроса", http.StatusBadRequest)
+		return
 	}
-}
-
-func notifyHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var notif PaymentNotificationData
-		if err := json.NewDecoder(r.Body).Decode(&notif); err != nil {
-			http.Error(w, "Invalid notification format", http.StatusBadRequest)
-			return
-		}
-
-		// Проверка платежа в БД
-		var payment Payment
-		if err := db.Preload("Shop").Preload("Terminal").Preload("Items").Preload("Items.Product").Where("order_id = ?", notif.OrderID).First(&payment).Error; err != nil {
-			log.Printf("Payment not found: %s", notif.OrderID)
-			http.Error(w, "Payment not found", http.StatusBadRequest)
-			return
-		}
-
-		// Обновляем статус платежа
-		payment.Status = notif.Status
-		if err := db.Save(&payment).Error; err != nil {
-			log.Printf("Failed to update payment status: %v", err)
-			http.Error(w, "Failed to update payment", http.StatusInternalServerError)
-			return
-		}
-
-		// Если платеж подтвержден, отправляем информацию во внешний сервис
-		if notif.Status == "CONFIRMED" {
-			go processSuccessfulPayment(payment)
-		}
-
-		w.WriteHeader(http.StatusOK)
+	// валидация
+	if req.OrderID == "" || req.Amount == 0 || req.ClientIP == "" || req.PlayerName == "" || req.Email == "" {
+		http.Error(w, "Поля order_id, amount, client_ip, player_name и email обязательны", http.StatusBadRequest)
+		return
 	}
-}
+	// формируем URLs с передачей player_name
+	q := url.Values{}
+	q.Set("order_id", req.OrderID)
+	q.Set("player_name", req.PlayerName)
+	successURL := fmt.Sprintf("%s?%s", config.Server.SuccessURL, q.Encode())
+	failURL := fmt.Sprintf("%s?%s", config.Server.FailURL, q.Encode())
 
-func shopListHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		shopsMutex.RLock()
-		shops := make([]ShopResponse, 0, len(shopCache))
-		for _, shop := range shopCache {
-			products := make([]ProductResponse, 0, len(shop.Products))
-			for _, product := range shop.Products {
-				if product.Active {
-					products = append(products, ProductResponse{
-						UUID:        product.UUID,
-						SKU:         product.SKU,
-						Name:        product.Name,
-						Description: product.Description,
-						Price:       product.Price,
-						Image:       product.Image,
-					})
-				}
-			}
-
-			shops = append(shops, ShopResponse{
-				UUID:        shop.UUID,
-				Name:        shop.Name,
-				Description: shop.Description,
-				Products:    products,
-			})
-		}
-		shopsMutex.RUnlock()
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(shops)
+	initReq := &tinkoff.InitRequest{
+		Amount:          req.Amount,
+		OrderID:         req.OrderID,
+		ClientIP:        req.ClientIP,
+		Description:     req.Description,
+		Language:        "ru",
+		SuccessURL:      successURL,
+		FailURL:         failURL,
+		NotificationURL: config.Tinkoff.NotificationURL,
+		Receipt:         convertReceipt(req.Receipt, req.Amount),
 	}
-}
-
-// Обработка успешного платежа
-func processSuccessfulPayment(payment Payment) {
-	log.Printf("Processing successful payment: %s", payment.OrderID)
-
-	var products []map[string]interface{}
-	for _, item := range payment.Items {
-		products = append(products, map[string]interface{}{
-			"id":       item.Product.UUID,
-			"name":     item.Product.Name,
-			"quantity": item.Quantity,
-			"price":    item.Price,
-			"total":    item.TotalPrice,
-		})
-	}
-
-	payload := map[string]interface{}{
-		"order_id":    payment.OrderID,
-		"payment_id":  payment.PaymentID,
-		"shop_id":     payment.Shop.UUID,
-		"player_name": payment.PlayerName,
-		"email":       payment.Email,
-		"amount":      payment.Amount,
-		"products":    products,
-		"created_at":  payment.CreatedAt.Format(time.RFC3339),
-	}
-
-	// Повторяем отправку при ошибках
-	for i := 0; i <= config.ExternalService.MaxRetries; i++ {
-		if i > 0 {
-			backoff := time.Duration(1<<uint(i-1)) * time.Second
-			log.Printf("Retrying external service in %v (attempt %d/%d)", backoff, i, config.ExternalService.MaxRetries)
-			time.Sleep(backoff)
-		}
-
-		if err := sendToExternalService(payload); err == nil {
-			return
-		}
-	}
-
-	log.Printf("Failed to send payment data to external service after %d attempts", config.ExternalService.MaxRetries+1)
-}
-
-// Отправка данных во внешний сервис
-func sendToExternalService(payload map[string]interface{}) error {
-	payloadBytes, err := json.Marshal(payload)
-	if err != nil {
-		log.Printf("Failed to marshal payload: %v", err)
-		return err
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(config.ExternalService.Timeout)*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, "POST", config.ExternalService.Domain, bytes.NewBuffer(payloadBytes))
+	initResp, err := tinkoffClient.InitWithContext(ctx, initReq)
 	if err != nil {
-		log.Printf("Failed to create request: %v", err)
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("External service error: %v", err)
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		log.Printf("External service returned error status: %s", resp.Status)
-		return fmt.Errorf("external service error: %s", resp.Status)
+		log.Printf("Ошибка инициализации платежа: %v", err)
+		http.Error(w, "Ошибка инициализации платежа", http.StatusInternalServerError)
+		return
 	}
 
-	log.Printf("External service response: %s", resp.Status)
-	return nil
+	// сохраняем в БД
+	receiptItemsJSON, _ := json.Marshal(req.Receipt.Items)
+	payment := Payment{
+		OrderID:      req.OrderID,
+		PaymentID:    initResp.PaymentID,
+		Amount:       req.Amount,
+		Description:  req.Description,
+		ClientIP:     req.ClientIP,
+		PaymentURL:   initResp.PaymentURL,
+		Status:       "INIT",
+		PlayerName:   req.PlayerName,
+		Email:        req.Email,
+		ProductImage: req.ProductImage,
+		ReceiptItems: string(receiptItemsJSON),
+	}
+	db.Create(&payment)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(PaymentResponse{PaymentURL: initResp.PaymentURL})
 }
 
-// Запуск периодического обновления кэша
-func startCacheUpdater(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
+// notifyHandler – обработчик уведомлений от Tinkoff.
+func notifyHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Метод не поддерживается", http.StatusMethodNotAllowed)
+		return
+	}
+	var notif PaymentNotificationData
+	if err := json.NewDecoder(r.Body).Decode(&notif); err != nil {
+		log.Printf("Ошибка декодирования уведомления: %v", err)
+		http.Error(w, "Неверный формат уведомления", http.StatusBadRequest)
+		return
+	}
 
-	for {
-		select {
-		case <-ticker.C:
-			if err := updateShopCache(); err != nil {
-				log.Printf("Failed to update shop cache: %v", err)
-			}
-		case <-ctx.Done():
-			return
+	// находим платеж
+	var payment Payment
+	if err := db.Where("order_id = ?", notif.OrderID).First(&payment).Error; err != nil {
+		log.Printf("Платеж не найден: %v", err)
+	} else {
+		payment.Status = notif.Status
+		payment.PaymentID = notif.PaymentID.String()
+		db.Save(&payment)
+
+		// если подтверждён — показываем никнейм
+		if notif.Status == tinkoff.StatusConfirmed {
+			fmt.Printf("[SUCCESS] PlayerName: %q\n", payment.PlayerName)
 		}
 	}
+
+	w.Write([]byte("OK"))
 }
 
-// Проверка здоровья сервиса
-func healthCheckHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		type HealthStatus struct {
-			Status    string `json:"status"`
-			Timestamp string `json:"timestamp"`
-			Version   string `json:"version"`
-		}
-
-		status := HealthStatus{
-			Status:    "ok",
-			Timestamp: time.Now().Format(time.RFC3339),
-			Version:   "2.0.0",
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(status)
+// checkHandler – проверка статуса на запросе.
+func checkHandler(w http.ResponseWriter, r *http.Request) {
+	orderID := r.URL.Query().Get("order_id")
+	if orderID == "" {
+		http.Error(w, "order_id обязателен", http.StatusBadRequest)
+		return
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	res, err := tinkoffClient.CheckOrderWithContext(ctx, &tinkoff.CheckOrderRequest{OrderID: orderID})
+	if err != nil {
+		http.Error(w, "Ошибка проверки", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(res)
 }
 
 func main() {
-	// Загрузка конфигурации
+	// загрузка конфигурации
 	if err := loadConfig(); err != nil {
-		log.Fatalf("Config error: %v", err)
+		log.Fatalf("config load error: %v", err)
 	}
-
-	// Инициализация базы данных
+	// инициализация БД
 	if err := initDB(); err != nil {
-		log.Fatalf("Database error: %v", err)
+		log.Fatalf("db init error: %v", err)
 	}
+	// клиент Тинькофф
+	tinkoffClient = tinkoff.NewClient(config.Tinkoff.TerminalKey, config.Tinkoff.SecretKey)
 
-	// Загрузка магазинов из конфигурации
-	if err := loadShops(); err != nil {
-		log.Fatalf("Shop loading error: %v", err)
-	}
+	// маршруты
+	mux := http.NewServeMux()
+	mux.HandleFunc("/pay", payHandler)
+	mux.HandleFunc("/notify", notifyHandler)
+	mux.HandleFunc("/check", checkHandler)
 
-	// Обновление кэша магазинов
-	if err := updateShopCache(); err != nil {
-		log.Fatalf("Shop cache update error: %v", err)
-	}
+	c := cors.New(cors.Options{
+		AllowedOrigins:   config.CORS.AllowedOrigins,
+		AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
+		AllowedHeaders:   []string{"Content-Type"},
+		AllowCredentials: true,
+	})
+	handler := c.Handler(mux)
 
-	// Инициализация семафора для ограничения количества одновременных запросов
-	sem = semaphore.NewWeighted(int64(config.Server.Workers))
-
-	// Создание сервиса для работы с Tinkoff API
-	tinkoffService := NewTinkoffService()
-
-	// Настройка обработчиков маршрутов
-	router := http.NewServeMux()
-	router.HandleFunc("/pay", payHandler(tinkoffService))
-	router.HandleFunc("/notify", notifyHandler())
-	router.HandleFunc("/shops", shopListHandler())
-	router.HandleFunc("/health", healthCheckHandler())
-
-	// Настройка CORS
-	corsHandler := cors.New(cors.Options{
-		AllowedOrigins: config.CORS.AllowedOrigins,
-		AllowedMethods: config.CORS.AllowedMethods,
-		AllowedHeaders: []string{"Content-Type", "Authorization"},
-	}).Handler(router)
-
-	Addr:         ":" + config.Server.Port,
-		Handler:      corsHandler,
-		ReadTimeout:  time.Duration(config.Server.ReadTimeout) * time.Second,
-		WriteTimeout: time.Duration(config.Server.WriteTimeout) * time.Second,
-	}
-
-	// Создание контекста для корректного завершения
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Запуск фонового обновления кэша
-	go startCacheUpdater(ctx)
-
-	// Настройка обработки сигналов для корректного завершения
-	go gracefulShutdown(ctx, cancel, server)
-
-	// Запуск HTTP сервера
-	log.Printf("Server starting on port %s with %d workers", config.Server.Port, config.Server.Workers)
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("Server error: %v", err)
-	}
-}
-
-// Корректное завершение работы сервера
-func gracefulShutdown(ctx context.Context, cancel context.CancelFunc, server *http.Server) {
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-
-	<-stop
-	log.Println("Shutting down server...")
-	cancel() // Отмена контекста для завершения работы всех goroutine
-
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer shutdownCancel()
-
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Printf("Server shutdown error: %v", err)
-	}
-
-	log.Println("Server gracefully stopped")
-}
-	// Создание HTTP сервера
+	// graceful shutdown
 	server := &http.Server{
-		Addr:         ":" + config.Server.Port,
+		Addr:    ":" + config.Server.Port,
+		Handler: handler,
+	}
+	idle := make(chan struct{})
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+		<-sig
+		server.Shutdown(context.Background())
+		close(idle)
+	}()
+
+	log.Printf("Сервер запущен на порту %s", config.Server.Port)
+	if err := server.ListenAndServe(); err != http.ErrServerClosed {
+		log.Fatalf("ListenAndServe: %v", err)
+	}
+	<-idle
+	log.Println("Сервер остановлен")
+}
