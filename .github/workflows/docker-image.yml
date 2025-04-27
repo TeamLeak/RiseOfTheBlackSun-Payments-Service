@@ -1,18 +1,38 @@
+# .github/workflows/docker-image-ci.yml
 name: Docker Image CI
 
 on:
   push:
-    branches: [ "master" ]
+    branches: ["master"]
   pull_request:
-    branches: [ "master" ]
+    branches: ["master"]
 
 jobs:
-
   build:
-
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Build the Docker image
-      run: docker build . --file Dockerfile --tag my-image-name:$(date +%s)
+      - uses: actions/checkout@v4
+
+      # 1) Устанавливаем Go
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: "1.24"
+
+      # 2) Если модуль ещё не инициализирован — создаём его и подтягиваем зависимости
+      - name: Initialize Go module
+        run: |
+          # Перейти в директорию, где лежат исходники:
+          cd payments-service
+          # Инициализуем модуль (замените на ваш импорт-путь)
+          go mod tidy
+
+      # 3) Собираем Docker-образ
+      - name: Build the Docker image
+        working-directory: ./payments-service
+        run: |
+          docker build \
+            -f Dockerfile \
+            -t my-image-name:$(date +%s) \
+            .
