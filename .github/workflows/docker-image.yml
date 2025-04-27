@@ -1,4 +1,3 @@
-# .github/workflows/docker-image-ci.yml
 name: Docker Image CI
 
 on:
@@ -20,17 +19,17 @@ jobs:
         with:
           go-version: "1.24"
 
-      # 2) Если модуль ещё не инициализирован — создаём его и подтягиваем зависимости
+      # 2) Инициализируем go.mod/go.sum прямо в корне репозитория
       - name: Initialize Go module
         run: |
-          # Перейти в директорию, где лежат исходники:
-          cd payments-service
-          # Инициализуем модуль (замените на ваш импорт-путь)
+          # если go.mod ещё нет — инициализируем модуль
+          if [ ! -f go.mod ]; then
+            go mod init github.com/${{ github.repository }}
+          fi
           go mod tidy
 
-      # 3) Собираем Docker-образ
+      # 3) Собираем Docker-образ из корня
       - name: Build the Docker image
-        working-directory: ./payments-service
         run: |
           docker build \
             -f Dockerfile \
