@@ -1,24 +1,19 @@
-# config.yaml (рядом с main.go)
-
 server:
   port: "8080"
-  success_url: "https://example.com/success"
-  fail_url: "https://example.com/fail"
+  success_url: "https://bosinn.world/pay_success"
+  fail_url: "https://bosinn.world/pay_errored"
 
 tinkoff:
-  terminal_key: "YOUR_TERMINAL_KEY"
-  secret_key: "YOUR_SECRET_KEY"
-  notification_url: "https://yourdomain.com/notify"
-
+  terminal_key: ""
+  secret_key: ""
+  notification_url: "https://payment.bosinn.world/notify"
+  default_taxation: "osn"   # значение системы налогообложения для всех товаров
 database:
-  dialect: "sqlite3"
-  connection: "payments.db"
+  dialect: "sqlite3"       # или "postgres"
+  connection: "test.db"      # для postgres укажи connection string
 
 cors:
   allowed_origins:
+    - "https://riseoftheblacksun.eu"
+    - "riseoftheblacksun.eu"
     - "*"
-
-rcon:
-  address: "127.0.0.1:25575"
-  password: "minecraft_rcon_password"
-  command: "op {player}"
